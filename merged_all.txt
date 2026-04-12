@@ -1,0 +1,415 @@
+
+--- START: Terraform/backend/main.tf ---
+terraform {
+  required_version = ">= 1.3.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "project_name" {
+  type    = string
+  default = "simple-hello-world"
+}
+
+variable "bucket_prefix" {
+  type    = string
+  default = "simple-hello-world-tfstate"
+}
+
+variable "lock_table_prefix" {
+  type    = string
+  default = "simple-hello-world-tf-lock"
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+data "aws_caller_identity" "current" {}
+
+resource "aws_s3_bucket" "tf_bucket" {
+  bucket = "${var.bucket_prefix}-${data.aws_caller_identity.current.account_id}"
+}
+
+resource "aws_dynamodb_table" "tf_lock" {
+  name         = "${var.lock_table_prefix}-${data.aws_caller_identity.current.account_id}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockID"
+
+  attribute {
+    name = "LockID"
+    type = "S"
+  }
+}
+
+resource "aws_s3_account_public_access_block" "acc_access_tfstate" {
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_public_access_block" "bucket_access_tfstate" {
+  bucket = aws_s3_bucket.tf_bucket.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "versioning_tfstate" {
+  bucket = aws_s3_bucket.tf_bucket.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "encryption_tfstate" {
+  bucket = aws_s3_bucket.tf_bucket.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+output "tfstate_bucket" {
+  value = aws_s3_bucket.tf_bucket.bucket
+}
+
+output "dynamodb_table" {
+  value = aws_dynamodb_table.tf_lock.name
+}
+
+output "aws_region" {
+  value = var.aws_region
+}
+--- END: Terraform/backend/main.tf ---
+
+--- START: Terraform/deployment/backend.tf ---
+terraform {
+  backend "s3" {}
+}
+--- END: Terraform/deployment/backend.tf ---
+
+--- START: Terraform/deployment/data.tf ---
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+--- END: Terraform/deployment/data.tf ---
+
+--- START: Terraform/deployment/ecs.tf ---
+
+--- END: Terraform/deployment/ecs.tf ---
+
+--- START: Terraform/deployment/init.sh ---
+#!/usr/bin/env bash
+set -euo pipefail
+
+TFSTATE_BUCKET_PREFIX="${TFSTATE_BUCKET_PREFIX:-simple-hello-world-tfstate}"
+LOCK_TABLE_PREFIX="${LOCK_TABLE_PREFIX:-simple-hello-world-tf-lock}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+STATE_KEY="${STATE_KEY:-deployment/terraform.tfstate}"
+
+aws sts get-caller-identity > /dev/null 2>&1 || {
+  echo "❌ AWS CLI not configured. Run aws configure first."
+  exit 1
+}
+
+ACCOUNT_ID="$(aws sts get-caller-identity --query "Account" --output text)"
+
+TFSTATE_BUCKET="${TFSTATE_BUCKET_PREFIX}-${ACCOUNT_ID}"
+LOCK_TABLE="${LOCK_TABLE_PREFIX}-${ACCOUNT_ID}"
+
+echo "✅ AWS region: ${AWS_REGION}"
+echo "✅ AWS account: ${ACCOUNT_ID}"
+echo "✅ TF state bucket: ${TFSTATE_BUCKET}"
+echo "✅ Lock table: ${LOCK_TABLE}"
+echo "✅ State key: ${STATE_KEY}"
+
+if ! aws s3api head-bucket --bucket "${TFSTATE_BUCKET}" 2>/dev/null; then
+  echo "❌ Backend bucket does not exist: ${TFSTATE_BUCKET}"
+  exit 1
+fi
+
+if ! aws dynamodb describe-table --table-name "${LOCK_TABLE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "❌ DynamoDB lock table does not exist: ${LOCK_TABLE}"
+  exit 1
+fi
+
+terraform init \
+  -backend-config="bucket=${TFSTATE_BUCKET}" \
+  -backend-config="key=${STATE_KEY}" \
+  -backend-config="region=${AWS_REGION}" \
+  -backend-config="dynamodb_table=${LOCK_TABLE}"
+--- END: Terraform/deployment/init.sh ---
+
+--- START: Terraform/deployment/locals.tf ---
+locals {
+  common_tags = {
+    Project     = var.project_name
+    Environment = "dev"
+    ManagedBy   = "Terraform"
+  }
+
+  name_prefix = var.project_name
+
+  ecr_repository_name = "${local.name_prefix}-repo"
+  ecs_cluster_name    = "${local.name_prefix}-cluster"
+  ecs_service_name    = "${local.name_prefix}-service"
+  task_family         = "${local.name_prefix}-task"
+
+  alb_name          = "${local.name_prefix}-alb"
+  target_group_name = "${local.name_prefix}-tg"
+
+  log_group_name = "/ecs/${var.project_name}"
+}
+--- END: Terraform/deployment/locals.tf ---
+
+--- START: Terraform/deployment/outputs.tf ---
+
+--- END: Terraform/deployment/outputs.tf ---
+
+--- START: Terraform/deployment/providers.tf ---
+terraform {
+  required_version = ">= 1.3.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+--- END: Terraform/deployment/providers.tf ---
+
+--- START: Terraform/deployment/variables.tf ---
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "project_name" {
+  type    = string
+  default = "simple-hello-world"
+}
+
+variable "vpc_cidr" {
+  type    = string
+  default = "10.0.0.0/16"
+}
+
+variable "public_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.1.0/24", "10.0.2.0/24"]
+}
+
+variable "private_subnet_cidrs" {
+  type    = list(string)
+  default = ["10.0.11.0/24", "10.0.12.0/24"]
+}
+
+variable "container_port" {
+  type    = number
+  default = 8080
+}
+
+variable "container_cpu" {
+  type    = number
+  default = 256
+}
+
+variable "container_memory" {
+  type    = number
+  default = 512
+}
+
+variable "desired_count" {
+  type    = number
+  default = 2
+}
+
+variable "min_capacity" {
+  type    = number
+  default = 2
+}
+
+variable "max_capacity" {
+  type    = number
+  default = 4
+}
+
+variable "health_check_path" {
+  type    = string
+  default = "/health"
+}
+
+variable "image_tag" {
+  type    = string
+  default = "latest"
+}
+--- END: Terraform/deployment/variables.tf ---
+
+--- START: Terraform/deployment/vpc.tf ---
+resource "aws_vpc" "vpc_ecs" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-vpc"
+  })
+}
+
+resource "aws_internet_gateway" "igw_ecs" {
+  vpc_id = aws_vpc.vpc_ecs.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-igw"
+  })
+}
+
+resource "aws_subnet" "public_subnet_ecs" {
+  count = length(var.public_subnet_cidrs)
+
+  vpc_id                  = aws_vpc.vpc_ecs.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-subnet-${count.index + 1}"
+  })
+}
+
+resource "aws_subnet" "private_subnet_ecs" {
+  count = length(var.private_subnet_cidrs)
+
+  vpc_id            = aws_vpc.vpc_ecs.id
+  cidr_block        = var.private_subnet_cidrs[count.index]
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-private-subnet-${count.index + 1}"
+  })
+}
+
+resource "aws_eip" "nat_ecs" {
+  domain = "vpc"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-nat-eip"
+  })
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat_ecs.id
+  subnet_id     = aws_subnet.public_subnet_ecs[0].id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-nat"
+  })
+
+  depends_on = [aws_internet_gateway.igw_ecs]
+}
+
+resource "aws_route_table" "public_subnet_ecs" {
+  vpc_id = aws_vpc.vpc_ecs.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-rt"
+  })
+}
+
+resource "aws_route" "public_internet_access" {
+  route_table_id         = aws_route_table.public_subnet_ecs.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw_ecs.id
+}
+
+resource "aws_route_table_association" "public" {
+  count = length(aws_subnet.public_subnet_ecs)
+
+  subnet_id      = aws_subnet.public_subnet_ecs[count.index].id
+  route_table_id = aws_route_table.public_subnet_ecs.id
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.vpc_ecs.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-private-rt"
+  })
+}
+
+resource "aws_route" "private_nat_access" {
+  route_table_id         = aws_route_table.private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.main.id
+}
+
+resource "aws_route_table_association" "private" {
+  count = length(aws_subnet.private_subnet_ecs)
+
+  subnet_id      = aws_subnet.private_subnet_ecs[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+--- END: Terraform/deployment/vpc.tf ---
+
+--- START: app/Dockerfile ---
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY hello.py .
+
+EXPOSE 8080
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "hello:app"]
+--- END: app/Dockerfile ---
+
+--- START: app/hello.py ---
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Hello World from ECS!"
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+--- END: app/hello.py ---
+
+--- START: app/requirements.txt ---
+flask==3.0.3
+gunicorn==22.0.0
+--- END: app/requirements.txt ---
