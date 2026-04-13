@@ -22,3 +22,18 @@ output "cloudwatch_log_group_name" {
   description = "CloudWatch log group used by the ECS task"
   value       = aws_cloudwatch_log_group.ecs_logs.name
 }
+
+output "ecr_repository_arn" {
+  description = "ECR repository ARN"
+  value       = aws_ecr_repository.app_repo.arn
+}
+
+output "ecs_task_execution_role_arn" {
+  description = "ECS task execution role ARN"
+  value       = aws_iam_role.ecs_task_execution_role.arn
+}
+
+output "ecs_task_role_arn" {
+  description = "ECS task role ARN"
+  value       = aws_iam_role.ecs_task_role.arn
+}
