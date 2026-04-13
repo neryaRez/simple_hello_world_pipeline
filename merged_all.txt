@@ -99,6 +99,84 @@ output "aws_region" {
 }
 --- END: Terraform/backend/main.tf ---
 
+--- START: Terraform/deployment/alb.tf ---
+resource "aws_lb" "app_alb" {
+  name               = local.alb_name
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = aws_subnet.public_subnet_ecs[*].id
+
+  enable_deletion_protection = false
+
+  tags = merge(local.common_tags, {
+    Name = local.alb_name
+  })
+}
+
+resource "aws_lb_target_group" "app_tg" {
+  name        = local.target_group_name
+  port        = var.container_port
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.vpc_ecs.id
+  target_type = "ip"
+
+  health_check {
+    enabled             = true
+    path                = var.health_check_path
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+
+  tags = merge(local.common_tags, {
+    Name = local.target_group_name
+  })
+}
+
+resource "aws_lb_listener" "http_listener" {
+  load_balancer_arn = aws_lb.app_alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app_tg.arn
+  }
+}
+--- END: Terraform/deployment/alb.tf ---
+
+--- START: Terraform/deployment/autoscaling.tf ---
+resource "aws_appautoscaling_target" "ecs_service_target" {
+  max_capacity       = var.max_capacity
+  min_capacity       = var.min_capacity
+  resource_id        = "service/${aws_ecs_cluster.app_cluster.name}/${aws_ecs_service.app_service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+resource "aws_appautoscaling_policy" "ecs_cpu_target_tracking" {
+  name               = "${local.name_prefix}-cpu-target-tracking"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.ecs_service_target.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_service_target.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_service_target.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = 60
+    scale_in_cooldown  = 120
+    scale_out_cooldown = 60
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+--- END: Terraform/deployment/autoscaling.tf ---
+
 --- START: Terraform/deployment/backend.tf ---
 terraform {
   backend "s3" {}
@@ -115,9 +193,170 @@ data "aws_availability_zones" "available" {
 }
 --- END: Terraform/deployment/data.tf ---
 
---- START: Terraform/deployment/ecs.tf ---
+--- START: Terraform/deployment/ecr.tf ---
+resource "aws_ecr_repository" "app_repo" {
+  name                 = local.ecr_repository_name
+  image_tag_mutability = "MUTABLE"
 
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+
+  tags = merge(local.common_tags, {
+    Name = local.ecr_repository_name
+  })
+}
+--- END: Terraform/deployment/ecr.tf ---
+
+--- START: Terraform/deployment/ecs.tf ---
+resource "aws_ecs_cluster" "app_cluster" {
+  name = local.ecs_cluster_name
+
+  tags = merge(local.common_tags, {
+    Name = local.ecs_cluster_name
+  })
+}
+
+resource "aws_ecs_task_definition" "app_task" {
+  family                   = local.task_family
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+
+  cpu    = tostring(var.container_cpu)
+  memory = tostring(var.container_memory)
+
+  execution_role_arn = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn      = aws_iam_role.ecs_task_role.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "X86_64"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name      = "hello-world"
+      image     = "${aws_ecr_repository.app_repo.repository_url}:${var.image_tag}"
+      essential = true
+
+      portMappings = [
+        {
+          containerPort = var.container_port
+          hostPort      = var.container_port
+          protocol      = "tcp"
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.ecs_logs.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "ecs"
+        }
+      }
+    }
+  ])
+
+  tags = merge(local.common_tags, {
+    Name = local.task_family
+  })
+}
+
+resource "aws_ecs_service" "app_service" {
+  name            = local.ecs_service_name
+  cluster         = aws_ecs_cluster.app_cluster.id
+  task_definition = aws_ecs_task_definition.app_task.arn
+  desired_count   = var.desired_count
+  launch_type     = "FARGATE"
+
+  deployment_minimum_healthy_percent = 50
+  deployment_maximum_percent         = 200
+  health_check_grace_period_seconds  = 60
+
+  network_configuration {
+    subnets          = aws_subnet.private_subnet_ecs[*].id
+    security_groups  = [aws_security_group.ecs_tasks_sg.id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.app_tg.arn
+    container_name   = "hello-world"
+    container_port   = var.container_port
+  }
+
+  depends_on = [
+    aws_lb_listener.http_listener
+  ]
+
+  tags = merge(local.common_tags, {
+    Name = local.ecs_service_name
+  })
+}
 --- END: Terraform/deployment/ecs.tf ---
+
+--- START: Terraform/deployment/iam.tf ---
+resource "aws_cloudwatch_log_group" "ecs_logs" {
+  name              = local.log_group_name
+  retention_in_days = 14
+
+  tags = merge(local.common_tags, {
+    Name = local.log_group_name
+  })
+}
+
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "${local.name_prefix}-ecs-task-execution-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ecs-task-execution-role"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
+  role       = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+resource "aws_iam_role" "ecs_task_role" {
+  name = "${local.name_prefix}-ecs-task-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "ecs-tasks.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ecs-task-role"
+  })
+}
+--- END: Terraform/deployment/iam.tf ---
 
 --- START: Terraform/deployment/init.sh ---
 #!/usr/bin/env bash
@@ -184,7 +423,30 @@ locals {
 --- END: Terraform/deployment/locals.tf ---
 
 --- START: Terraform/deployment/outputs.tf ---
+output "alb_dns_name" {
+  description = "Public DNS name of the Application Load Balancer"
+  value       = aws_lb.app_alb.dns_name
+}
 
+output "ecr_repository_url" {
+  description = "ECR repository URL for pushing the application image"
+  value       = aws_ecr_repository.app_repo.repository_url
+}
+
+output "ecs_cluster_name" {
+  description = "ECS cluster name"
+  value       = aws_ecs_cluster.app_cluster.name
+}
+
+output "ecs_service_name" {
+  description = "ECS service name"
+  value       = aws_ecs_service.app_service.name
+}
+
+output "cloudwatch_log_group_name" {
+  description = "CloudWatch log group used by the ECS task"
+  value       = aws_cloudwatch_log_group.ecs_logs.name
+}
 --- END: Terraform/deployment/outputs.tf ---
 
 --- START: Terraform/deployment/providers.tf ---
@@ -203,6 +465,60 @@ provider "aws" {
   region = var.aws_region
 }
 --- END: Terraform/deployment/providers.tf ---
+
+--- START: Terraform/deployment/sg.tf ---
+resource "aws_security_group" "alb_sg" {
+  name        = "${local.name_prefix}-alb-sg"
+  description = "Security group for public ALB"
+  vpc_id      = aws_vpc.vpc_ecs.id
+
+  ingress {
+    description = "Allow HTTP from the internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-alb-sg"
+  })
+}
+
+resource "aws_security_group" "ecs_tasks_sg" {
+  name        = "${local.name_prefix}-ecs-tasks-sg"
+  description = "Security group for ECS tasks in private subnets"
+  vpc_id      = aws_vpc.vpc_ecs.id
+
+  ingress {
+    description     = "Allow app traffic only from ALB"
+    from_port       = var.container_port
+    to_port         = var.container_port
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  egress {
+    description = "Allow all outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ecs-tasks-sg"
+  })
+}
+--- END: Terraform/deployment/sg.tf ---
 
 --- START: Terraform/deployment/variables.tf ---
 variable "aws_region" {
@@ -315,7 +631,7 @@ resource "aws_subnet" "private_subnet_ecs" {
   })
 }
 
-resource "aws_eip" "nat_ecs" {
+resource "aws_eip" "e_nat_ecs" {
   domain = "vpc"
 
   tags = merge(local.common_tags, {
@@ -323,8 +639,8 @@ resource "aws_eip" "nat_ecs" {
   })
 }
 
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat_ecs.id
+resource "aws_nat_gateway" "nat_ecs" {
+  allocation_id = aws_eip.e_nat_ecs.id
   subnet_id     = aws_subnet.public_subnet_ecs[0].id
 
   tags = merge(local.common_tags, {
@@ -334,7 +650,7 @@ resource "aws_nat_gateway" "main" {
   depends_on = [aws_internet_gateway.igw_ecs]
 }
 
-resource "aws_route_table" "public_subnet_ecs" {
+resource "aws_route_table" "rt_public_ecs" {
   vpc_id = aws_vpc.vpc_ecs.id
 
   tags = merge(local.common_tags, {
@@ -342,20 +658,20 @@ resource "aws_route_table" "public_subnet_ecs" {
   })
 }
 
-resource "aws_route" "public_internet_access" {
-  route_table_id         = aws_route_table.public_subnet_ecs.id
+resource "aws_route" "route_public_ecs" {
+  route_table_id         = aws_route_table.rt_public_ecs.id
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.igw_ecs.id
 }
 
-resource "aws_route_table_association" "public" {
+resource "aws_route_table_association" "rta_public_ecs" {
   count = length(aws_subnet.public_subnet_ecs)
 
   subnet_id      = aws_subnet.public_subnet_ecs[count.index].id
-  route_table_id = aws_route_table.public_subnet_ecs.id
+  route_table_id = aws_route_table.rt_public_ecs.id
 }
 
-resource "aws_route_table" "private" {
+resource "aws_route_table" "rt_private_ecs" {
   vpc_id = aws_vpc.vpc_ecs.id
 
   tags = merge(local.common_tags, {
@@ -363,19 +679,55 @@ resource "aws_route_table" "private" {
   })
 }
 
-resource "aws_route" "private_nat_access" {
-  route_table_id         = aws_route_table.private.id
+resource "aws_route" "route_private_ecs" {
+  route_table_id         = aws_route_table.rt_private_ecs.id
   destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.main.id
+  nat_gateway_id         = aws_nat_gateway.nat_ecs.id
 }
 
-resource "aws_route_table_association" "private" {
+resource "aws_route_table_association" "rta_private_ecs" {
   count = length(aws_subnet.private_subnet_ecs)
 
   subnet_id      = aws_subnet.private_subnet_ecs[count.index].id
-  route_table_id = aws_route_table.private.id
+  route_table_id = aws_route_table.rt_private_ecs.id
 }
 --- END: Terraform/deployment/vpc.tf ---
+
+--- START: Terraform/pipeline/backend.tf ---
+
+--- END: Terraform/pipeline/backend.tf ---
+
+--- START: Terraform/pipeline/codebuild.tf ---
+
+--- END: Terraform/pipeline/codebuild.tf ---
+
+--- START: Terraform/pipeline/codepipeline.tf ---
+
+--- END: Terraform/pipeline/codepipeline.tf ---
+
+--- START: Terraform/pipeline/data.tf ---
+
+--- END: Terraform/pipeline/data.tf ---
+
+--- START: Terraform/pipeline/init.sh ---
+
+--- END: Terraform/pipeline/init.sh ---
+
+--- START: Terraform/pipeline/locals.tf ---
+
+--- END: Terraform/pipeline/locals.tf ---
+
+--- START: Terraform/pipeline/outputs.tf ---
+
+--- END: Terraform/pipeline/outputs.tf ---
+
+--- START: Terraform/pipeline/providers.tf ---
+
+--- END: Terraform/pipeline/providers.tf ---
+
+--- START: Terraform/pipeline/variables.tf ---
+
+--- END: Terraform/pipeline/variables.tf ---
 
 --- START: app/Dockerfile ---
 FROM python:3.12-slim
