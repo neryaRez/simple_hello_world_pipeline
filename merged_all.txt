@@ -1,4 +1,35 @@
 
+--- START: buildspec.yml ---
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URL"
+      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}"
+      - echo "Using image tag: $IMAGE_TAG"
+
+  build:
+    commands:
+      - echo "Building Docker image..."
+      - docker build -t "$ECR_REPOSITORY_URL:$IMAGE_TAG" ./app
+      - docker tag "$ECR_REPOSITORY_URL:$IMAGE_TAG" "$ECR_REPOSITORY_URL:latest"
+
+  post_build:
+    commands:
+      - echo "Pushing Docker images..."
+      - docker push "$ECR_REPOSITORY_URL:$IMAGE_TAG"
+      - docker push "$ECR_REPOSITORY_URL:latest"
+      - echo "Generating imagedefinitions.json..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$ECS_CONTAINER_NAME" "$ECR_REPOSITORY_URL:$IMAGE_TAG" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
+--- END: buildspec.yml ---
+
 --- START: Terraform/backend/main.tf ---
 terraform {
   required_version = ">= 1.3.0"
@@ -447,6 +478,21 @@ output "cloudwatch_log_group_name" {
   description = "CloudWatch log group used by the ECS task"
   value       = aws_cloudwatch_log_group.ecs_logs.name
 }
+
+output "ecr_repository_arn" {
+  description = "ECR repository ARN"
+  value       = aws_ecr_repository.app_repo.arn
+}
+
+output "ecs_task_execution_role_arn" {
+  description = "ECS task execution role ARN"
+  value       = aws_iam_role.ecs_task_execution_role.arn
+}
+
+output "ecs_task_role_arn" {
+  description = "ECS task role ARN"
+  value       = aws_iam_role.ecs_task_role.arn
+}
 --- END: Terraform/deployment/outputs.tf ---
 
 --- START: Terraform/deployment/providers.tf ---
@@ -694,39 +740,518 @@ resource "aws_route_table_association" "rta_private_ecs" {
 --- END: Terraform/deployment/vpc.tf ---
 
 --- START: Terraform/pipeline/backend.tf ---
-
+terraform {
+  backend "s3" {}
+}
 --- END: Terraform/pipeline/backend.tf ---
 
 --- START: Terraform/pipeline/codebuild.tf ---
+resource "aws_iam_role" "codebuild_role" {
+  name = "${local.name_prefix}-codebuild-role"
 
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "codebuild.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-codebuild-role"
+  })
+}
+
+resource "aws_iam_role_policy" "codebuild_policy" {
+  name = "${local.name_prefix}-codebuild-policy"
+  role = aws_iam_role.codebuild_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "CloudWatchLogsAccess"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3ArtifactsAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject"
+        ]
+        Resource = [
+          "${aws_s3_bucket.pipeline_artifacts.arn}",
+          "${aws_s3_bucket.pipeline_artifacts.arn}/*"
+        ]
+      },
+      {
+        Sid    = "ECRPushPullAccess"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRRepositoryAccess"
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:CompleteLayerUpload",
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:ListImages",
+          "ecr:PutImage",
+          "ecr:UploadLayerPart"
+        ]
+        Resource = data.terraform_remote_state.deployment.outputs.ecr_repository_arn
+      }
+    ]
+  })
+}
+
+resource "aws_codebuild_project" "app_build" {
+  name         = local.codebuild_project_name
+  description  = "Build Docker image, push to ECR, and generate imagedefinitions.json"
+  service_role = aws_iam_role.codebuild_role.arn
+
+  artifacts {
+    type = "CODEPIPELINE"
+  }
+
+  environment {
+    compute_type                = "BUILD_GENERAL1_SMALL"
+    image                       = "aws/codebuild/standard:7.0"
+    type                        = "LINUX_CONTAINER"
+    privileged_mode             = true
+    image_pull_credentials_type = "CODEBUILD"
+
+    environment_variable {
+      name  = "AWS_DEFAULT_REGION"
+      value = var.aws_region
+    }
+
+    environment_variable {
+      name  = "AWS_ACCOUNT_ID"
+      value = data.aws_caller_identity.current.account_id
+    }
+
+    environment_variable {
+      name  = "ECR_REPOSITORY_URL"
+      value = data.terraform_remote_state.deployment.outputs.ecr_repository_url
+    }
+
+    environment_variable {
+      name  = "ECS_CONTAINER_NAME"
+      value = var.container_name
+    }
+  }
+
+  source {
+    type      = "CODEPIPELINE"
+    buildspec = var.buildspec_path
+  }
+
+  tags = merge(local.common_tags, {
+    Name = local.codebuild_project_name
+  })
+}
 --- END: Terraform/pipeline/codebuild.tf ---
 
 --- START: Terraform/pipeline/codepipeline.tf ---
+resource "aws_s3_bucket" "pipeline_artifacts" {
+  bucket = local.artifact_bucket_name
 
+  tags = merge(local.common_tags, {
+    Name = local.artifact_bucket_name
+  })
+}
+
+resource "aws_s3_bucket_public_access_block" "pipeline_artifacts_pab" {
+  bucket = aws_s3_bucket.pipeline_artifacts.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "pipeline_artifacts_versioning" {
+  bucket = aws_s3_bucket.pipeline_artifacts.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "pipeline_artifacts_encryption" {
+  bucket = aws_s3_bucket.pipeline_artifacts.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_iam_role" "codepipeline_role" {
+  name = "${local.name_prefix}-codepipeline-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "codepipeline.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-codepipeline-role"
+  })
+}
+
+resource "aws_iam_role_policy" "codepipeline_policy" {
+  name = "${local.name_prefix}-codepipeline-policy"
+  role = aws_iam_role.codepipeline_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "S3ArtifactsAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketVersioning",
+          "s3:GetBucketLocation",
+          "s3:ListBucket"
+        ]
+        Resource = aws_s3_bucket.pipeline_artifacts.arn
+      },
+      {
+        Sid    = "S3ArtifactsObjectsAccess"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion",
+          "s3:PutObject"
+        ]
+        Resource = "${aws_s3_bucket.pipeline_artifacts.arn}/*"
+      },
+      {
+        Sid    = "UseCodeConnections"
+        Effect = "Allow"
+        Action = [
+          "codestar-connections:UseConnection",
+          "codeconnections:UseConnection"
+        ]
+        Resource = var.codestar_connection_arn
+      },
+      {
+        Sid    = "StartAndReadCodeBuild"
+        Effect = "Allow"
+        Action = [
+          "codebuild:BatchGetBuilds",
+          "codebuild:StartBuild"
+        ]
+        Resource = aws_codebuild_project.app_build.arn
+      },
+      {
+        Sid    = "ECSDeployAccess"
+        Effect = "Allow"
+        Action = [
+          "ecs:DescribeServices",
+          "ecs:DescribeTaskDefinition",
+          "ecs:DescribeTasks",
+          "ecs:ListTasks",
+          "ecs:RegisterTaskDefinition",
+          "ecs:UpdateService"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "PassTaskRolesToECS"
+        Effect = "Allow"
+        Action = "iam:PassRole"
+        Resource = [
+          data.terraform_remote_state.deployment.outputs.ecs_task_execution_role_arn,
+          data.terraform_remote_state.deployment.outputs.ecs_task_role_arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_codepipeline" "app_pipeline" {
+  name     = local.codepipeline_name
+  role_arn = aws_iam_role.codepipeline_role.arn
+
+  artifact_store {
+    location = aws_s3_bucket.pipeline_artifacts.bucket
+    type     = "S3"
+  }
+
+  stage {
+    name = "Source"
+
+    action {
+      name             = "GitHub_Source"
+      category         = "Source"
+      owner            = "AWS"
+      provider         = "CodeStarSourceConnection"
+      version          = "1"
+      output_artifacts = [local.source_output_artifact]
+
+      configuration = {
+        ConnectionArn        = var.codestar_connection_arn
+        FullRepositoryId     = "${var.github_owner}/${var.github_repo}"
+        BranchName           = var.github_branch
+        OutputArtifactFormat = "CODE_ZIP"
+      }
+    }
+  }
+
+  stage {
+    name = "Build"
+
+    action {
+      name             = "Docker_Build_And_Push"
+      category         = "Build"
+      owner            = "AWS"
+      provider         = "CodeBuild"
+      version          = "1"
+      input_artifacts  = [local.source_output_artifact]
+      output_artifacts = [local.build_output_artifact]
+
+      configuration = {
+        ProjectName = aws_codebuild_project.app_build.name
+      }
+    }
+  }
+
+  stage {
+    name = "Deploy"
+
+    action {
+      name            = "Deploy_To_ECS"
+      category        = "Deploy"
+      owner           = "AWS"
+      provider        = "ECS"
+      version         = "1"
+      input_artifacts = [local.build_output_artifact]
+
+      configuration = {
+        ClusterName = data.terraform_remote_state.deployment.outputs.ecs_cluster_name
+        ServiceName = data.terraform_remote_state.deployment.outputs.ecs_service_name
+        FileName    = "imagedefinitions.json"
+      }
+    }
+  }
+
+  tags = merge(local.common_tags, {
+    Name = local.codepipeline_name
+  })
+}
 --- END: Terraform/pipeline/codepipeline.tf ---
 
 --- START: Terraform/pipeline/data.tf ---
+data "aws_caller_identity" "current" {}
 
+data "aws_region" "current" {}
+
+data "terraform_remote_state" "deployment" {
+  backend = "s3"
+
+  config = {
+    bucket         = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}"
+    key            = var.deployment_state_key
+    region         = var.aws_region
+    dynamodb_table = "${var.project_name}-tf-lock-${data.aws_caller_identity.current.account_id}"
+  }
+}
 --- END: Terraform/pipeline/data.tf ---
 
 --- START: Terraform/pipeline/init.sh ---
+#!/usr/bin/env bash
+set -euo pipefail
 
+TFSTATE_BUCKET_PREFIX="${TFSTATE_BUCKET_PREFIX:-simple-hello-world-tfstate}"
+LOCK_TABLE_PREFIX="${LOCK_TABLE_PREFIX:-simple-hello-world-tf-lock}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
+STATE_KEY="${STATE_KEY:-pipeline/terraform.tfstate}"
+
+aws sts get-caller-identity > /dev/null 2>&1 || {
+  echo "❌ AWS CLI not configured. Run aws configure first."
+  exit 1
+}
+
+ACCOUNT_ID="$(aws sts get-caller-identity --query "Account" --output text)"
+
+TFSTATE_BUCKET="${TFSTATE_BUCKET_PREFIX}-${ACCOUNT_ID}"
+LOCK_TABLE="${LOCK_TABLE_PREFIX}-${ACCOUNT_ID}"
+
+echo "✅ AWS region: ${AWS_REGION}"
+echo "✅ AWS account: ${ACCOUNT_ID}"
+echo "✅ TF state bucket: ${TFSTATE_BUCKET}"
+echo "✅ Lock table: ${LOCK_TABLE}"
+echo "✅ State key: ${STATE_KEY}"
+
+if ! aws s3api head-bucket --bucket "${TFSTATE_BUCKET}" 2>/dev/null; then
+  echo "❌ Backend bucket does not exist: ${TFSTATE_BUCKET}"
+  exit 1
+fi
+
+if ! aws dynamodb describe-table --table-name "${LOCK_TABLE}" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "❌ DynamoDB lock table does not exist: ${LOCK_TABLE}"
+  exit 1
+fi
+
+terraform init \
+  -backend-config="bucket=${TFSTATE_BUCKET}" \
+  -backend-config="key=${STATE_KEY}" \
+  -backend-config="region=${AWS_REGION}" \
+  -backend-config="dynamodb_table=${LOCK_TABLE}"
 --- END: Terraform/pipeline/init.sh ---
 
 --- START: Terraform/pipeline/locals.tf ---
+locals {
+  common_tags = {
+    Project     = var.project_name
+    Environment = "dev"
+    ManagedBy   = "Terraform"
+  }
 
+  name_prefix = var.project_name
+
+  codebuild_project_name = "${local.name_prefix}-build"
+  codepipeline_name      = "${local.name_prefix}-pipeline"
+  artifact_bucket_name   = "${local.name_prefix}-pipeline-artifacts-${data.aws_caller_identity.current.account_id}"
+
+  source_output_artifact = "source_output"
+  build_output_artifact  = "build_output"
+}
 --- END: Terraform/pipeline/locals.tf ---
 
 --- START: Terraform/pipeline/outputs.tf ---
+output "codebuild_project_name" {
+  description = "CodeBuild project name"
+  value       = aws_codebuild_project.app_build.name
+}
 
+output "codepipeline_name" {
+  description = "CodePipeline pipeline name"
+  value       = aws_codepipeline.app_pipeline.name
+}
+
+output "pipeline_artifact_bucket_name" {
+  description = "S3 bucket used for pipeline artifacts"
+  value       = aws_s3_bucket.pipeline_artifacts.bucket
+}
+
+output "deployment_ecr_repository_url" {
+  description = "ECR repository URL read from deployment remote state"
+  value       = data.terraform_remote_state.deployment.outputs.ecr_repository_url
+}
+
+output "deployment_ecs_cluster_name" {
+  description = "ECS cluster name read from deployment remote state"
+  value       = data.terraform_remote_state.deployment.outputs.ecs_cluster_name
+}
+
+output "deployment_ecs_service_name" {
+  description = "ECS service name read from deployment remote state"
+  value       = data.terraform_remote_state.deployment.outputs.ecs_service_name
+}
 --- END: Terraform/pipeline/outputs.tf ---
 
 --- START: Terraform/pipeline/providers.tf ---
+terraform {
+  required_version = ">= 1.3.0"
 
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
 --- END: Terraform/pipeline/providers.tf ---
 
 --- START: Terraform/pipeline/variables.tf ---
+variable "aws_region" {
+  description = "AWS region for the pipeline stack"
+  type        = string
+  default     = "us-east-1"
+}
 
+variable "project_name" {
+  description = "Project base name"
+  type        = string
+  default     = "simple-hello-world"
+}
+
+variable "github_owner" {
+  description = "GitHub owner or organization name"
+  type        = string
+}
+
+variable "github_repo" {
+  description = "GitHub repository name"
+  type        = string
+}
+
+variable "github_branch" {
+  description = "GitHub branch to track"
+  type        = string
+  default     = "main"
+}
+
+variable "codestar_connection_arn" {
+  description = "AWS CodeConnections connection ARN for GitHub"
+  type        = string
+}
+
+variable "container_name" {
+  description = "Container name used by ECS and imagedefinitions.json"
+  type        = string
+  default     = "hello-world"
+}
+
+variable "buildspec_path" {
+  description = "Path to buildspec file inside the repository"
+  type        = string
+  default     = "buildspec.yml"
+}
+
+variable "deployment_state_key" {
+  description = "S3 backend key of the deployment stack state"
+  type        = string
+  default     = "deployment/terraform.tfstate"
+}
 --- END: Terraform/pipeline/variables.tf ---
 
 --- START: app/Dockerfile ---
