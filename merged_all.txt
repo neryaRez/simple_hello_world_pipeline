@@ -5,25 +5,25 @@ version: 0.2
 phases:
   pre_build:
     commands:
-      - echo "Logging in to Amazon ECR..."
-      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URL"
-      - 'IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:0:7}"'
-      - echo "Using image tag: $IMAGE_TAG"
+      - 'echo "Logging in to Amazon ECR..."'
+      - 'aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REPOSITORY_URL"'
+      - 'IMAGE_TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)'
+      - 'echo "Using image tag: $IMAGE_TAG"'
 
   build:
     commands:
-      - echo "Building Docker image..."
-      - docker build -t "$ECR_REPOSITORY_URL:$IMAGE_TAG" ./app
-      - docker tag "$ECR_REPOSITORY_URL:$IMAGE_TAG" "$ECR_REPOSITORY_URL:latest"
+      - 'echo "Building Docker image..."'
+      - 'docker build -t "$ECR_REPOSITORY_URL:$IMAGE_TAG" ./app'
+      - 'docker tag "$ECR_REPOSITORY_URL:$IMAGE_TAG" "$ECR_REPOSITORY_URL:latest"'
 
   post_build:
     commands:
-      - echo "Pushing Docker images..."
-      - docker push "$ECR_REPOSITORY_URL:$IMAGE_TAG"
-      - docker push "$ECR_REPOSITORY_URL:latest"
-      - echo "Generating imagedefinitions.json..."
-      - printf '[{"name":"%s","imageUri":"%s"}]' "$ECS_CONTAINER_NAME" "$ECR_REPOSITORY_URL:$IMAGE_TAG" > imagedefinitions.json
-      - cat imagedefinitions.json
+      - 'echo "Pushing Docker images..."'
+      - 'docker push "$ECR_REPOSITORY_URL:$IMAGE_TAG"'
+      - 'docker push "$ECR_REPOSITORY_URL:latest"'
+      - 'echo "Generating imagedefinitions.json..."'
+      - 'printf ''[{"name":"%s","imageUri":"%s"}]'' "$ECS_CONTAINER_NAME" "$ECR_REPOSITORY_URL:$IMAGE_TAG" > imagedefinitions.json'
+      - 'cat imagedefinitions.json'
 
 artifacts:
   files:
@@ -1266,7 +1266,7 @@ variable "deployment_state_key" {
 --- END: Terraform/pipeline/variables.tf ---
 
 --- START: app/Dockerfile ---
-FROM python:3.12-slim
+FROM public.ecr.aws/docker/library/python:3.12-slim
 
 WORKDIR /app
 
